@@ -1,14 +1,11 @@
 // #define _GNU_SOURCE // g++ does this for us
 #include <new>
-#include <map>
-#include <queue>
+#include <vector>
 #include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
 #include <thread>
-#include <functional>
-#include <utility>
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,37 +19,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include <cryptopp/sha.h>
-#include <cryptopp/filters.h>
-#include <cryptopp/base64.h>
-
-// trimming
-#include <algorithm>
-#include <cctype>
-#include <locale>
-
-// trim from start (in place)
-static inline void ltrim(std::string &s) {
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
-        return !std::isspace(ch);
-    }));
-}
-
-// trim from end (in place)
-static inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
-}
-
-// trim from both ends (in place)
-static inline void trim(std::string &s) {
-    ltrim(s);
-    rtrim(s);
-}
-// trimming end
-
-typedef uint8_t u8;
+#include "utility.hpp"
+#include "hash.hpp"
+#include "ws.hpp"
 
 /*
  * Scaling read() and write() needs edge-trigger + EPOLLONESHOT, to prevent race
@@ -64,11 +33,6 @@ constexpr uint32_t CONN_SOCK_RECV_EVENT_MASK = EPOLLIN | EPOLLET | EPOLLONESHOT;
 constexpr uint32_t CONN_SOCK_SEND_EVENT_MASK = EPOLLOUT | EPOLLONESHOT;
 
 constexpr int BUFSIZE = 4096;
-
-enum WsState {
-	HANDSHAKE, WEBSOCKET
-};
-
 // print error and exit when ret == -1
 static int guard(int ret, const char *errmsg)
 {
@@ -80,115 +44,10 @@ static int guard(int ret, const char *errmsg)
 	}
 }
 
-std::string string_tolower(std::string s)
-{
-	std::transform(s.begin(), s.end(), s.begin(),
-			[](char c) { return tolower(c); });
-	return s;
-}
 
-std::string base64_encode(const std::string  &s)
-{
-	std::string digest;
-
-	CryptoPP::StringSource foo(s, true,
-			new CryptoPP::Base64Encoder(
-				new CryptoPP::StringSink(digest), /* newline= */ false));
-
-	return digest;
-}
-
-std::string sha1_then_base64_encode(const std::string &s)
-{
-    std::string digest;
-    CryptoPP::SHA1 sha1;
-
-    CryptoPP::StringSource foo(s, true,
-    new CryptoPP::HashFilter(sha1,
-      new CryptoPP::Base64Encoder(
-         new CryptoPP::StringSink(digest), /* newline= */ false)));
-
-    return digest;
-}
-
-class WsReqHeader {
-public:
-	WsReqHeader(const std::string &h) {
-		using namespace std;
-		deque<string> lines = string_split(h, "\r\n");
-
-		first_line = lines.front();
-		lines.pop_front();
-
-		for_each(lines.begin(), lines.end(),
-				[&](const string &s) {
-					int pos = s.find(":");
-					auto key = s.substr(0, pos);
-					auto value = s.substr(pos + 1);
-					trim(key);
-					trim(value);
-					key = string_tolower(key);
-					//value = string_tolower(value);
-
-					headers.insert(pair(key, value));
-				});
-	}
-
-	bool validate() {
-		return true;
-	}
-
-	std::vector<u8> build_success_resp() {
-		std::string resp;
-		resp = "HTTP/1.1 101 Switching Protocols\r\n"
-		"Upgrade: websocket\r\n"
-		"Connection: Upgrade\r\n"
-		"Sec-WebSocket-Accept: ";
-		
-		auto req_sec_key = headers.find(SEC_WEBSOCKET_KEY);
-		if (req_sec_key == headers.end()) {
-			fprintf(stderr, "[FATAL] cannot find Sec-WebSocket-Key in valid"
-					" request");
-			exit(EXIT_FAILURE);
-		}
-
-		std::string key = req_sec_key->second;
-		resp += sha1_then_base64_encode(key + KEY_MAGIC);
-		resp += "\r\n\r\n";
-
-		return std::vector<u8>(resp.begin(), resp.end());
-	}
-
-private:
-	std::string first_line;
-	std::map<std::string, std::string> headers;
-
-	static const char *HOST, *UPGRADE, *CONNECTION,
-				 *SEC_WEBSOCKET_KEY, *SEC_WEBSOCKET_VERSION;
-	static const char *KEY_MAGIC;
-
-	std::deque<std::string> string_split(const std::string &s,
-			const std::string &delim)
-	{
-		std::deque<std::string> d;
-		int64_t start = 0, pos;
-
-		while ((pos = s.find(delim, start)) != -1) {
-			d.emplace_back(s.substr(start, pos - start));
-			start = pos + delim.size();
-		}
-
-		return d;
-	}
+enum WsState {
+	HANDSHAKE, WEBSOCKET
 };
-
-const char *WsReqHeader::HOST = "host";
-const char *WsReqHeader::UPGRADE = "upgrade";
-const char *WsReqHeader::CONNECTION = "connection";
-const char *WsReqHeader::SEC_WEBSOCKET_KEY = "sec-websocket-key";
-const char *WsReqHeader::SEC_WEBSOCKET_VERSION = "sec-websocket-version";
-const char *WsReqHeader::KEY_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
 class EpollContext {
 public:
 	const size_t len = BUFSIZE;
@@ -221,7 +80,7 @@ public:
 		// parse handshake or frames
 		switch (state) {
 		case HANDSHAKE: {
-			// TODO parse multiple buffer
+			// TODO parse multiple buffer, i.e. incomplete header
 			auto buf = recv_queue.front();
 			recv_queue.pop_front();
 			string header(buf.begin(), buf.end());
