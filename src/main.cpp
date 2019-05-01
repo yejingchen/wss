@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
+#include <cassert>
 
 #include <sys/epoll.h>
 #include <sys/types.h>
@@ -44,9 +45,24 @@ static int guard(int ret, const char *errmsg)
 	}
 }
 
+void handle_frame(Frame *frame)
+{
+	if (frame->opcode != Frame::CONTINUATION && frame->fin) {
+		FILE *file = fopen("msg.txt", "a");
+		int nwritten = fwrite(frame->payload.data(), frame->payload.size(), 1,
+				file);
+		fprintf(stderr, "write file: nwritten = %d, payload size %lu\n",
+				nwritten, frame->payload.size());
+		fprintf(file, "\n");
+		if (nwritten != 1) {
+			perror("write file failed");
+		}
+		fclose(file);
+	}
+}
 
 enum WsState {
-	HANDSHAKE, WEBSOCKET
+	HANDSHAKE, FRAME_HEADER, FRAME_PAYLOAD
 };
 class EpollContext {
 public:
@@ -77,29 +93,9 @@ public:
 
 		copy_to_recv_queue(buf, len);
 
-		// parse handshake or frames
-		switch (state) {
-		case HANDSHAKE: {
-			// TODO parse multiple buffer, i.e. incomplete header
-			auto buf = recv_queue.front();
-			recv_queue.pop_front();
-			string header(buf.begin(), buf.end());
-			fprintf(stderr, "[debug] received header:\n%s", header.c_str());
-			WsReqHeader req_header(header);
-
-			push_send_queue(req_header.build_success_resp());
-
-			state = WEBSOCKET;
-			break;
-		}
-		case WEBSOCKET: {
-			fprintf(stderr, "[debug] received frame\n");
-			auto buf = recv_queue.front();
-			recv_queue.pop_front();
-			write(1, buf.data(), buf.size());
-			break;
-		}
-		}
+		// now that we've waken up, we might have enough buffer to parse into
+		// header or frames.
+		parse();
 	}
 
 	void push_send_queue(const std::vector<u8> &buf) {
@@ -165,6 +161,14 @@ private:
 	std::deque<std::vector<u8>> send_queue;
 	std::deque<std::vector<u8>> recv_queue;
 
+	// current parsing frame
+	Frame *frame = nullptr;
+	// total bytes copied to current frame payload.
+	// only used in parse().
+	u64 ncopied = 0;
+	// start position of frame 'Payload Data' in a buffer
+	u64 buf_payload_start;
+
 	void copy_to_recv_queue(void *buf, size_t len) {
 		recv_queue.emplace_back(len);
 		memmove(recv_queue.back().data(), buf, len);
@@ -195,6 +199,105 @@ private:
 			}
 		}
 	}
+
+	void parse() {
+		using namespace std;
+
+		while (!recv_queue.empty()) {
+			auto buf = recv_queue.front();
+			recv_queue.pop_front();
+
+			switch (state) {
+			case HANDSHAKE: {
+				// TODO read header precisely
+				string header(buf.begin(), buf.end());
+				fprintf(stderr, "[debug] received header:\n%s", header.c_str());
+				WsReqHeader req_header(header);
+
+				push_send_queue(req_header.build_success_resp());
+
+				state = FRAME_HEADER;
+				break;
+			}
+			case FRAME_HEADER: {
+				fprintf(stderr, "[debug] received frame header\n");
+
+				int header_len;
+				frame = Frame::try_parse_header(buf, header_len);
+				if (frame == nullptr) {
+					// if this buf contains incomplete frame header
+
+					if (recv_queue.empty()) {
+						recv_queue.push_front(buf);
+						return; // wait for more buffers
+					}
+
+					auto next_buf = recv_queue.front();
+					recv_queue.pop_front();
+
+					// try again with larger buffer
+					buf.insert(buf.end(), next_buf.begin(), next_buf.end());
+					recv_queue.push_front(buf);
+					continue;
+				}
+
+				buf_payload_start = header_len;
+				state = FRAME_PAYLOAD;
+
+				// if buffer has 'Payload Data' besides header
+				if (header_len < buf.size()) {
+					recv_queue.push_front(buf);
+				}
+
+				break;
+			}
+			case FRAME_PAYLOAD: {
+				assert(frame != nullptr);
+
+				u64 ncopied_now = frame->append_payload(ncopied, buf,
+						buf_payload_start);
+
+				bool buf_has_remaining =
+					buf_payload_start + ncopied_now < buf.size();
+				bool frame_complete =
+					ncopied + ncopied_now == frame->payload.size();
+
+				if (buf_has_remaining) {
+					assert(frame_complete);
+
+					u64 buf_copied = buf_payload_start + ncopied_now;
+
+					// current frame is all copied. this new `remaining` must
+					// starts at next frame border.
+					std::vector<u8> remaining(buf.size() - buf_copied);
+					memmove(remaining.data(), &buf[buf_copied],
+							buf.size() - buf_copied);
+					recv_queue.push_front(remaining);
+				}
+
+				if (frame_complete) {
+					// TODO handle complete frame
+					printf("Frame: %s\n", frame->header_to_string().c_str());
+					write(1, frame->payload.data(), frame->payload.size());
+
+					handle_frame(frame);
+
+					delete frame;
+
+					ncopied = 0;
+					state = FRAME_HEADER;
+				} else {
+					assert(!buf_has_remaining);
+					ncopied += ncopied_now;
+					buf_payload_start = 0;
+				}
+
+				break;
+			}
+			} // switch
+
+		} // while recv_queue !empty
+	} // void parse()
 
 };
 
@@ -382,8 +485,16 @@ void recv_event_loop(const int recv_epfd, const int send_epfd, const int listen_
 	struct epoll_event ev, events[MAX_EPOLL_EVENTS];
 	for (;;) {
 		fprintf(stderr, "[debug] recv waiting\n");
-		int nfds = guard(epoll_wait(recv_epfd, events, MAX_EPOLL_EVENTS, -1),
-				"epoll_wait failed");
+		int nfds = epoll_wait(recv_epfd, events, MAX_EPOLL_EVENTS, -1);
+		if (nfds == -1) {
+			if (errno == EINTR) {
+				continue; // ignore GDB breakpoint
+			} else {
+				perror("recv epoll_wait failed");
+				exit(EXIT_FAILURE);
+			}
+		}
+
 		fprintf(stderr, "[debug] received %d recv events\n", nfds);
 
 		for (int i = 0; i < nfds; i++) {
@@ -414,8 +525,15 @@ void send_event_loop(const int epfd)
 	struct epoll_event events[MAX_EPOLL_EVENTS];
 	for (;;) {
 		fprintf(stderr, "[debug] send waiting\n");
-		int nfds = guard(epoll_wait(epfd, events, MAX_EPOLL_EVENTS, -1),
-				"send_event_loop epoll_wait");
+		int nfds = epoll_wait(epfd, events, MAX_EPOLL_EVENTS, -1);
+		if (nfds == -1) {
+			if (errno == EINTR) {
+				continue; // ignore GDB breakpoint
+			} else {
+				perror("send epoll_wait failed");
+				exit(EXIT_FAILURE);
+			}
+		}
 		fprintf(stderr, "[debug] ready to send to %d sockets\n", nfds);
 
 		for (int i = 0; i < nfds; i++) {
