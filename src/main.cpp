@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <algorithm>
 #include <thread>
+#include <sstream>
 
 #include <cstdio>
 #include <cstdlib>
@@ -45,24 +46,32 @@ static int guard(int ret, const char *errmsg)
 	}
 }
 
-void handle_frame(Frame *frame)
+const char *filename = "msg.txt";
+void handle_frame(Frame *frame, FILE *file)
 {
-	if (frame->opcode != Frame::CONTINUATION && frame->fin) {
-		FILE *file = fopen("msg.txt", "a");
-		int nwritten = fwrite(frame->payload.data(), frame->payload.size(), 1,
-				file);
-		fprintf(stderr, "write file: nwritten = %d, payload size %lu\n",
-				nwritten, frame->payload.size());
-		fprintf(file, "\n");
-		if (nwritten != 1) {
-			perror("write file failed");
-		}
+	int nwritten = fwrite(frame->payload.data(), 1, frame->payload.size(),
+			file);
+	fprintf(stderr, "write file: nwritten = %d, payload size %lu\n",
+			nwritten, frame->payload.size());
+	if (nwritten < frame->payload.size()) {
+		perror("write file failed");
+	}
+
+	if (frame->fin) {
 		fclose(file);
 	}
 }
 
 enum WsState {
-	HANDSHAKE, FRAME_HEADER, FRAME_PAYLOAD
+	HANDSHAKE,
+	FRAME_HEADER,
+	FRAME_PAYLOAD,
+
+	// after parsing a complete frame, make sure next buffer aligns with next
+	// unhandled frame.
+	FRAME_HANDLE_REMAINING_BUFFER,
+
+	FRAME_COMPLETE,
 };
 class EpollContext {
 public:
@@ -74,8 +83,22 @@ public:
 
 	EpollContext(int fd, int epfd, int send_epfd)
 		: EpollContext(fd, epfd, send_epfd, operator new(BUFSIZE)) { }
+
 	EpollContext(int fd, int epfd, int send_epfd, void *buf)
-		: fd{fd}, epfd{epfd}, send_epfd{send_epfd}, buf{buf} { }
+		: fd{fd}, epfd{epfd}, send_epfd{send_epfd}, buf{buf} {
+			if (buf != nullptr) { // not a listen sock
+				std::stringstream ss;
+				ss << filename << '-' << fd;
+				auto fname = ss.str();
+
+				file = fopen(fname.c_str(), "w+");
+				if (!file) {
+					perror(fname.c_str());
+					exit(EXIT_FAILURE);
+				}
+			}
+		}
+
 	~EpollContext() {
 		// TODO remove self from some external lookup map
 		lock_queues();
@@ -161,13 +184,15 @@ private:
 	std::deque<std::vector<u8>> send_queue;
 	std::deque<std::vector<u8>> recv_queue;
 
+	FILE *file = nullptr;
+
 	// current parsing frame
 	Frame *frame = nullptr;
 	// total bytes copied to current frame payload.
 	// only used in parse().
 	u64 ncopied = 0;
-	// start position of frame 'Payload Data' in a buffer
-	u64 buf_payload_start;
+	// start position of unprocessed data in a buffer
+	u64 buf_start;
 
 	void copy_to_recv_queue(void *buf, size_t len) {
 		recv_queue.emplace_back(len);
@@ -203,14 +228,17 @@ private:
 	void parse() {
 		using namespace std;
 
-		while (!recv_queue.empty()) {
-			auto buf = recv_queue.front();
-			recv_queue.pop_front();
+		while (!recv_queue.empty() || state == FRAME_COMPLETE) {
+			// auto buf = recv_queue.front();
+			// recv_queue.pop_front();
 
 			switch (state) {
 			case HANDSHAKE: {
 				// TODO read header precisely
+
+				auto &buf = recv_queue.front();
 				string header(buf.begin(), buf.end());
+				recv_queue.pop_front();
 				fprintf(stderr, "[debug] received header:\n%s", header.c_str());
 				WsReqHeader req_header(header);
 
@@ -221,6 +249,9 @@ private:
 			}
 			case FRAME_HEADER: {
 				fprintf(stderr, "[debug] received frame header\n");
+
+				auto buf = recv_queue.front();
+				recv_queue.pop_front();
 
 				int header_len;
 				frame = Frame::try_parse_header(buf, header_len);
@@ -241,56 +272,86 @@ private:
 					continue;
 				}
 
-				buf_payload_start = header_len;
-				state = FRAME_PAYLOAD;
+				WsState intent = frame->payload.size() > 0 ?
+					FRAME_PAYLOAD : FRAME_COMPLETE;
 
-				// if buffer has 'Payload Data' besides header
+				// if buffer contains more than a frame header
 				if (header_len < buf.size()) {
-					recv_queue.push_front(buf);
+					switch (intent) {
+					case FRAME_PAYLOAD:
+						buf_start = header_len;
+						recv_queue.push_front(buf);
+						state = FRAME_PAYLOAD;
+						break;
+					case FRAME_COMPLETE:
+						state = FRAME_HANDLE_REMAINING_BUFFER;
+						break;
+					default:
+						fprintf(stderr, "Impossible intent in parse()\n");
+						exit(EXIT_FAILURE);
+					}
+				} else {
+					state = intent;
 				}
 
 				break;
 			}
 			case FRAME_PAYLOAD: {
+				auto &buf = recv_queue.front();
+
 				assert(frame != nullptr);
 
-				u64 ncopied_now = frame->append_payload(ncopied, buf,
-						buf_payload_start);
+				u64 ncopied_now = frame->append_payload(ncopied, buf, buf_start);
 
-				bool buf_has_remaining =
-					buf_payload_start + ncopied_now < buf.size();
+				bool buf_has_remaining = buf_start + ncopied_now < buf.size();
 				bool frame_complete =
 					ncopied + ncopied_now == frame->payload.size();
 
 				if (buf_has_remaining) {
 					assert(frame_complete);
+					buf_start += ncopied_now;
 
-					u64 buf_copied = buf_payload_start + ncopied_now;
-
-					// current frame is all copied. this new `remaining` must
-					// starts at next frame border.
-					std::vector<u8> remaining(buf.size() - buf_copied);
-					memmove(remaining.data(), &buf[buf_copied],
-							buf.size() - buf_copied);
-					recv_queue.push_front(remaining);
+					//recv_queue.push_front(buf);
+					state = FRAME_HANDLE_REMAINING_BUFFER;
+					break;
 				}
 
+				// current buffer is done.
+				recv_queue.pop_front();
+
 				if (frame_complete) {
-					// TODO handle complete frame
-					printf("Frame: %s\n", frame->header_to_string().c_str());
-					write(1, frame->payload.data(), frame->payload.size());
-
-					handle_frame(frame);
-
-					delete frame;
-
-					ncopied = 0;
-					state = FRAME_HEADER;
+					state = FRAME_COMPLETE;
 				} else {
 					assert(!buf_has_remaining);
 					ncopied += ncopied_now;
-					buf_payload_start = 0;
+					buf_start = 0;
+					state = FRAME_PAYLOAD;
 				}
+
+				break;
+			}
+			case FRAME_HANDLE_REMAINING_BUFFER: {
+				auto &buf = recv_queue.front();
+				// current frame is all copied. this new `remaining` must
+				// starts at next frame border.
+				std::vector<u8> remaining(buf.size() - buf_start);
+				memmove(remaining.data(), &buf[buf_start],
+						buf.size() - buf_start);
+				buf = remaining;
+
+				state = FRAME_COMPLETE;
+				break;
+			}
+			case FRAME_COMPLETE: {
+				// TODO handle complete frame
+				printf("Frame: %s\n", frame->header_to_string().c_str());
+
+				handle_frame(frame, file);
+
+				delete frame;
+
+				ncopied = 0;
+				state = FRAME_HEADER;
 
 				break;
 			}
@@ -544,9 +605,13 @@ void send_event_loop(const int epfd)
 
 int main(int argc, char *argv[])
 {
-	if (argc == 1) {
+	if (argc < 2) {
 		fprintf(stderr, "[debug] usage: epd <port>\n");
 		exit(EXIT_FAILURE);
+	}
+
+	if (argc == 3) {
+		filename = argv[2];
 	}
 
 	int listen_sock = create_listen_sock(argv[1]);

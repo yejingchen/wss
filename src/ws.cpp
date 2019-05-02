@@ -187,8 +187,9 @@ std::string Frame::header_to_string() const
 	ss << "mask=0x";
 	for (int i = 0; i < 4; i++)
 		ss << hex << uppercase << setfill('0') << setw(2) << (u32) masking_key[i];
+	ss << " }";
 
-	return ss.str() + "}\n";
+	return ss.str();
 }
 
 const char *Frame::OPCODE_NAMES[16] = {
