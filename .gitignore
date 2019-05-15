@@ -1,5 +1,6 @@
 build/
 clangbuild/
+release/
 .ccls-cache/
 
 ### Vim ###
