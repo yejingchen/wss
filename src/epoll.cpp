@@ -1,13 +1,15 @@
 #include "epoll.hpp"
 
-const char *filename = "msg.txt";
+const char *filename = "received.bin";
 void handle_frame(Frame *frame, FILE *file)
 {
 	int nwritten = fwrite(frame->payload.data(), 1, frame->payload.size(),
 			file);
-	fprintf(stderr, "write file: nwritten = %d, payload size %lu\n",
+#ifdef DEBUG
+	fprintf(stderr, "[debug] write file: nwritten = %d, payload size %lu\n",
 			nwritten, frame->payload.size());
-	if (nwritten < frame->payload.size()) {
+#endif
+	if ((unsigned long) nwritten < frame->payload.size()) {
 		perror("write file failed");
 	}
 
@@ -85,7 +87,9 @@ void EpollContext::unget_send_queue(std::vector<u8> &vec) {
 }
 
 void EpollContext::rearm_send_epoll() {
+#ifdef DEBUG
 	fprintf(stderr, "[debug] re-arm send\n");
+#endif
 	struct epoll_event ev;
 	ev.data.ptr = this;
 
@@ -95,7 +99,9 @@ void EpollContext::rearm_send_epoll() {
 }
 
 void EpollContext::rearm_recv_epoll() {
+#ifdef DEBUG
 	fprintf(stderr, "[debug] re-arm recv\n");
+#endif
 	struct epoll_event ev;
 	ev.data.ptr = this;
 
@@ -120,7 +126,9 @@ void EpollContext::lock_queues() {
  * Will panic on other errors.
  */
 void EpollContext::try_add_to_send_epoll() {
+#ifdef DEBUG
 	fprintf(stderr, "[debug] adding send\n");
+#endif
 	struct epoll_event ev;
 	ev.events = CONN_SOCK_SEND_EVENT_MASK;
 	ev.data.ptr = this;
@@ -149,7 +157,9 @@ void EpollContext::parse() {
 			auto &buf = recv_queue.front();
 			string header(buf.begin(), buf.end());
 			recv_queue.pop_front();
+#ifdef DEBUG
 			fprintf(stderr, "[debug] received header:\n%s", header.c_str());
+#endif
 			WsReqHeader req_header(header);
 
 			push_send_queue(req_header.build_success_resp());
@@ -158,7 +168,9 @@ void EpollContext::parse() {
 			break;
 		}
 		case FRAME_HEADER: {
+#ifdef DEBUG
 			fprintf(stderr, "[debug] received frame header\n");
+#endif
 
 			auto buf = recv_queue.front();
 			recv_queue.pop_front();
@@ -186,7 +198,7 @@ void EpollContext::parse() {
 				FRAME_PAYLOAD : FRAME_COMPLETE;
 
 			// if buffer contains more than a frame header
-			if (header_len < buf.size()) {
+			if ((unsigned) header_len < buf.size()) {
 				buf_start = header_len;
 				recv_queue.push_front(buf);
 
@@ -255,7 +267,9 @@ void EpollContext::parse() {
 		}
 		case FRAME_COMPLETE: {
 			// TODO handle complete frame
-			printf("Frame: %s\n", frame->header_to_string().c_str());
+#ifdef DEBUG
+			printf("[debug] Frame: %s\n", frame->header_to_string().c_str());
+#endif
 
 			handle_frame(frame, file);
 

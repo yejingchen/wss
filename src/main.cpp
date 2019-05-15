@@ -133,7 +133,7 @@ void handle_epollout(struct epoll_event &ev)
 			fprintf(stderr, "fd %d wrote 0 byte, WTF\n", ctx->fd);
 			break;
 		} else if (nwritten > 0) {
-			if (nwritten < buf.size()) {
+			if ((unsigned long) nwritten < buf.size()) {
 				std::vector<u8> remaining(buf.size() - nwritten);
 				memmove(remaining.data(), buf.data() + nwritten,
 						buf.size() - nwritten);
@@ -225,7 +225,9 @@ void recv_event_loop(const int recv_epfd, const int send_epfd,
 	mask_all_sig();
 	struct epoll_event ev, events[MAX_EPOLL_EVENTS];
 	for (;;) {
+#ifdef DEBUG
 		fprintf(stderr, "[debug] recv waiting\n");
+#endif
 		int nfds = epoll_wait(recv_epfd, events, MAX_EPOLL_EVENTS, -1);
 		if (nfds == -1) {
 			if (errno == EINTR) {
@@ -236,14 +238,18 @@ void recv_event_loop(const int recv_epfd, const int send_epfd,
 			}
 		}
 
+#ifdef DEBUG
 		fprintf(stderr, "[debug] received %d recv events\n", nfds);
+#endif
 
 		for (int i = 0; i < nfds; i++) {
 			EpollContext *ctx = (EpollContext *) events[i].data.ptr;
 			if (ctx->fd == listen_sock) {
 				int conn_sock = guard(accept4(listen_sock, NULL, NULL,
 							SOCK_NONBLOCK | SOCK_CLOEXEC), "cannot accept");
+#ifdef DEBUG
 				fprintf(stderr, "[debug] accepted\n");
+#endif
 
 				ev.events = CONN_SOCK_RECV_EVENT_MASK;
 				ev.data.ptr = new EpollContext(conn_sock, recv_epfd, send_epfd);
@@ -272,7 +278,9 @@ void send_event_loop(const int epfd, const mqd_t mqd)
 	mask_all_sig();
 	struct epoll_event events[MAX_EPOLL_EVENTS];
 	for (;;) {
+#ifdef DEBUG
 		fprintf(stderr, "[debug] send waiting\n");
+#endif
 		int nfds = epoll_wait(epfd, events, MAX_EPOLL_EVENTS, -1);
 		if (nfds == -1) {
 			if (errno == EINTR) {
@@ -282,7 +290,9 @@ void send_event_loop(const int epfd, const mqd_t mqd)
 				exit(EXIT_FAILURE);
 			}
 		}
+#ifdef DEBUG
 		fprintf(stderr, "[debug] ready to send to %d sockets\n", nfds);
+#endif
 
 		for (int i = 0; i < nfds; i++) {
 			EpollContext *ctx = (EpollContext *) events[i].data.ptr;
@@ -337,7 +347,9 @@ mqd_t create_mq()
 int main(int argc, char *argv[])
 {
 	if (argc < 2) {
+#ifdef DEBUG
 		fprintf(stderr, "[debug] usage: epd <port>\n");
+#endif
 		exit(EXIT_FAILURE);
 	}
 

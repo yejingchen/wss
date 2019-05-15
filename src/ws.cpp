@@ -94,7 +94,7 @@ u8 *Frame::do_mask(u8 *dst, const u8 *src, u64 len) const
  */
 Frame *Frame::try_parse_header(const std::vector<u8> buf, int &header_len)
 {
-	int _header_len = 2;
+	unsigned int _header_len = 2;
 	Frame *frame = nullptr;
 
 #define check_length() do {\
