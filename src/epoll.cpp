@@ -187,10 +187,11 @@ void EpollContext::parse() {
 
 			// if buffer contains more than a frame header
 			if (header_len < buf.size()) {
+				buf_start = header_len;
+				recv_queue.push_front(buf);
+
 				switch (intent) {
 				case FRAME_PAYLOAD:
-					buf_start = header_len;
-					recv_queue.push_front(buf);
 					state = FRAME_PAYLOAD;
 					break;
 				case FRAME_COMPLETE:
@@ -201,6 +202,7 @@ void EpollContext::parse() {
 					exit(EXIT_FAILURE);
 				}
 			} else {
+				buf_start = 0;
 				state = intent;
 			}
 
@@ -245,8 +247,7 @@ void EpollContext::parse() {
 			// current frame is all copied. this new `remaining` must
 			// starts at next frame border.
 			std::vector<u8> remaining(buf.size() - buf_start);
-			memmove(remaining.data(), &buf[buf_start],
-					buf.size() - buf_start);
+			memmove(remaining.data(), &buf[buf_start], remaining.size());
 			buf = remaining;
 
 			state = FRAME_COMPLETE;
@@ -259,6 +260,7 @@ void EpollContext::parse() {
 			handle_frame(frame, file);
 
 			delete frame;
+			frame = nullptr;
 
 			ncopied = 0;
 			state = FRAME_HEADER;
