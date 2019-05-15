@@ -25,7 +25,7 @@ EpollContext::EpollContext(int fd, int epfd, int send_epfd, void *buf)
 	: fd{fd}, epfd{epfd}, send_epfd{send_epfd}, buf{buf} {
 		if (buf != nullptr) { // not a listen sock
 			std::stringstream ss;
-			ss << filename << '-' << fd;
+			ss << fd << '-' << filename;
 			auto fname = ss.str();
 
 			file = fopen(fname.c_str(), "w+");
