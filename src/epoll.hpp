@@ -16,6 +16,12 @@
 
 #include "ws.hpp"
 
+/*
+ * Scaling read() and write() needs edge-trigger + EPOLLONESHOT, to prevent race
+ * condition where two thread both read incomplete (and maybe reordered) data of
+ * one socket.
+ * After reading or writing, this fd need to EPOLL_CTL_MOD again with this mask.
+ */
 constexpr uint32_t CONN_SOCK_RECV_EVENT_MASK = EPOLLIN | EPOLLET | EPOLLONESHOT;
 constexpr uint32_t CONN_SOCK_SEND_EVENT_MASK = EPOLLOUT | EPOLLONESHOT;
 

@@ -1,5 +1,7 @@
 // #define _GNU_SOURCE // g++ does this for us
 
+#include <sstream>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -15,13 +17,13 @@
 #include "ws.hpp"
 #include "epoll.hpp"
 
-/*
- * Scaling read() and write() needs edge-trigger + EPOLLONESHOT, to prevent race
- * condition where two thread both read incomplete (and maybe reordered) data of
- * one socket.
- * After reading or writing, this fd need to EPOLL_CTL_MOD again with this mask.
- */
 
+// for signal handler
+namespace wss_global {
+static int send_epfd;
+static mqd_t mqd;
+static EpollContext *mqd_ep_ctx;
+}
 
 /*
  * Mask all signals from current thread.
@@ -202,7 +204,8 @@ int create_recv_epfd(const int listen_sock, const mqd_t mqd)
 			"create recv: listen_sock");
 
 	ev.events = EPOLLIN;
-	ev.data.ptr = new EpollContext(mqd, epfd, -1, nullptr);
+	ev.data.ptr = wss_global::mqd_ep_ctx =
+		new EpollContext(mqd, epfd, -1, nullptr);
 	guard(epoll_ctl(epfd, EPOLL_CTL_ADD, mqd, &ev), "create recv: add mqd");
 
 	return epfd;
@@ -282,9 +285,53 @@ void send_event_loop(const int epfd, const mqd_t mqd)
 		fprintf(stderr, "[debug] ready to send to %d sockets\n", nfds);
 
 		for (int i = 0; i < nfds; i++) {
-			process_send_event(epfd, events[i]);
+			EpollContext *ctx = (EpollContext *) events[i].data.ptr;
+			if (ctx->fd == mqd) {
+				fprintf(stderr, "send loop shutting down\n");
+				return;
+			} else {
+				process_send_event(epfd, events[i]);
+			}
 		}
 	}
+}
+
+
+void sig_handler(int sig)
+{
+	fprintf(stderr, "Got signal %d, shutting down\n", sig);
+
+	struct epoll_event ev;
+	ev.events = EPOLLOUT;
+	ev.data.ptr = wss_global::mqd_ep_ctx;
+	guard(epoll_ctl(wss_global::send_epfd, EPOLL_CTL_ADD, wss_global::mqd, &ev),
+			"sig_handler: add to send epoll");
+
+	mq_send(wss_global::mqd, "", 1, 0);
+}
+
+void setup_sigaction()
+{
+	struct sigaction action;
+	action.sa_handler = sig_handler;
+	guard(sigaction(SIGTERM, &action, NULL), "sigaction SIGTERM");
+	guard(sigaction(SIGINT, &action, NULL), "sigaction SIGINT");
+}
+
+mqd_t create_mq()
+{
+	const char *wss_mq_filename = "/wss-mq";
+	int ret = mq_unlink(wss_mq_filename);
+	if (ret == -1 && errno != ENOENT)
+			guard(-1, "cannot delete old mq");
+
+	mqd_t mqd = mq_open(wss_mq_filename,
+			O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK,
+			S_IRUSR | S_IWUSR, NULL);
+	guard(mqd, "mq_open");
+	wss_global::mqd = mqd;
+
+	return mqd;
 }
 
 int main(int argc, char *argv[])
@@ -298,24 +345,35 @@ int main(int argc, char *argv[])
 		filename = argv[2];
 	}
 
-	pid_t pid = getpid();
-	std::string mq_filename("/wss-mq-");
-	mq_filename += pid;
-	mqd_t mqd = mq_open(mq_filename.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+	mqd_t mqd = create_mq();
 
 	int listen_sock = create_listen_sock(argv[1]);
 	int recv_epfd = create_recv_epfd(listen_sock, mqd);
 	int send_epfd = create_send_epfd();
+	wss_global::send_epfd = send_epfd; // for signal handler
 
-	std::thread send_loop([=]() {
-			send_event_loop(send_epfd, mqd);
-	});
-	std::thread recv_loop([=]() {
-			recv_event_loop(recv_epfd, send_epfd, listen_sock, mqd);
-	});
+	// only setup signal handler after namespace wss_global is all ready
+	setup_sigaction();
 
-	recv_loop.join();
+	auto send_loop_lambda = [=]() {
+		send_event_loop(send_epfd, mqd);
+	};
+	auto recv_loop_lambda = [=]() {
+		recv_event_loop(recv_epfd, send_epfd, listen_sock, mqd);
+	};
 
-	mq_close(mqd);
-	mq_unlink(mq_filename.c_str());
+	std::vector<std::thread> send_loops;
+	std::vector<std::thread> recv_loops;
+
+	for (int i = 0; i < 1; i++)
+		send_loops.emplace_back(send_loop_lambda);
+	for (int i = 0; i < 1; i++)
+		recv_loops.emplace_back(recv_loop_lambda);
+
+	for (auto &thr : send_loops) thr.join();
+	for (auto &thr : recv_loops) thr.join();
+
+	delete wss_global::mqd_ep_ctx;
+
+	fprintf(stderr, "Shutdown\n");
 }
