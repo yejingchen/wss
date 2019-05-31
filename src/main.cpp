@@ -11,6 +11,9 @@
 #include <csignal>
 #include <mqueue.h>
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
 #include "common.hpp"
 #include "utility.hpp"
 #include "hash.hpp"
@@ -33,6 +36,12 @@ void mask_all_sig(void)
 	sigset_t set;
 	sigfillset(&set);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+
+void set_sock_user_timeout(int sock, unsigned int milliseconds)
+{
+	setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+			&milliseconds, sizeof(milliseconds));
 }
 
 int create_listen_sock(const char *port)
@@ -222,7 +231,6 @@ constexpr int MAX_EPOLL_EVENTS = 20;
 void recv_event_loop(const int recv_epfd, const int send_epfd,
 		const int listen_sock, const mqd_t mqd)
 {
-	mask_all_sig();
 	struct epoll_event ev, events[MAX_EPOLL_EVENTS];
 	for (;;) {
 #ifdef DEBUG
@@ -257,9 +265,9 @@ void recv_event_loop(const int recv_epfd, const int send_epfd,
 				guard(epoll_ctl(recv_epfd, EPOLL_CTL_ADD, conn_sock, &ev),
 						"epoll_ctl: cannot add conn_sock");
 			} else if (ctx->fd == mqd) {
-				// We notify to shutdown by closing remote mq peer.
-				// But don't remove mqd from epoll, main thread will clean
-				// it up
+				// We're notified to shutdown by detecting closure of remote mq
+				// peer.  But don't remove mqd from epoll not, main thread will
+				// clean it up
 				fprintf(stderr, "recv loop shutting down\n");
 				return;
 			} else {
@@ -275,7 +283,6 @@ void recv_event_loop(const int recv_epfd, const int send_epfd,
  */
 void send_event_loop(const int epfd, const mqd_t mqd)
 {
-	mask_all_sig();
 	struct epoll_event events[MAX_EPOLL_EVENTS];
 	for (;;) {
 #ifdef DEBUG
@@ -364,13 +371,15 @@ int main(int argc, char *argv[])
 	int send_epfd = create_send_epfd();
 	wss_global::send_epfd = send_epfd; // for signal handler
 
-	// only setup signal handler after namespace wss_global is all ready
+	// only setup signal handler after wss_global::* is all ready
 	setup_sigaction();
 
 	auto send_loop_lambda = [=]() {
+		mask_all_sig();
 		send_event_loop(send_epfd, mqd);
 	};
 	auto recv_loop_lambda = [=]() {
+		mask_all_sig();
 		recv_event_loop(recv_epfd, send_epfd, listen_sock, mqd);
 	};
 
@@ -384,6 +393,8 @@ int main(int argc, char *argv[])
 
 	for (auto &thr : send_loops) thr.join();
 	for (auto &thr : recv_loops) thr.join();
+
+	// TODO delete all EpollContext
 
 	delete wss_global::mqd_ep_ctx;
 
